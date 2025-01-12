@@ -1,0 +1,2 @@
+# -J--enable-preview -J--add-modules=jdk.incubator.vector -Dsbt.argsfile=false
+-Dsbt.argsfile=false
