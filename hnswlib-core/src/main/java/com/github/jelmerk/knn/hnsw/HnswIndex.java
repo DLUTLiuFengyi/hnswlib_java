@@ -45,30 +45,30 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
 
     private boolean immutable;
     private int dimensions;
-    private int maxItemCount;
-    private int m;
-    private int maxM;
-    private int maxM0;
+    private int maxItemCount; // HNSW图所能容纳的最大节点个数
+    private int m; // topK的K
+    private int maxM; // Mmax，每个节点在每层所能连接的邻居的个数上限
+    private int maxM0; // 最底层的Mmax是其他层的2倍
     private double levelLambda;
-    private int ef;
-    private int efConstruction;
+    private int ef; // 查询时考虑的邻居个数
+    private int efConstruction; // 构建索引（插入阶段）时考虑的邻居个数
     private boolean removeEnabled;
 
-    private int nodeCount;
+    private int nodeCount; // HNSW图当前容纳的节点个数
 
     private volatile Node<TItem> entryPoint;
 
-    private AtomicReferenceArray<Node<TItem>> nodes;
-    private MutableObjectIntMap<TId> lookup;
+    private AtomicReferenceArray<Node<TItem>> nodes; // HNSW图的所有节点对象的集合
+    private MutableObjectIntMap<TId> lookup; // 快速判断一个item id对应的节点是否存在于当前hnsw图
     private MutableObjectLongMap<TId> deletedItemVersions;
     private Map<TId, Object> locks;
 
     private ObjectSerializer<TId> itemIdSerializer;
     private ObjectSerializer<TItem> itemSerializer;
 
-    private ReentrantLock globalLock;
+    private ReentrantLock globalLock; // 全局锁
 
-    private GenericObjectPool<ArrayBitSet> visitedBitSetPool;
+    private GenericObjectPool<ArrayBitSet> visitedBitSetPool; // visited数组
 
     private ArrayBitSet excludedCandidates;
 
@@ -111,6 +111,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
     }
 
     /**
+     * 获取当前hnsw图所存储的节点个数
      * {@inheritDoc}
      */
     @Override
@@ -124,6 +125,9 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
     }
 
     /**
+     * 给定item id，在hnsw图中查找对应的item
+     * 1、先用lookup表找到item id对应的node id
+     * 2、再用nodes表找到node id对应的真实节点对象，进而获取内部的item对象
      * {@inheritDoc}
      */
     @Override
@@ -214,7 +218,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
         if (item.dimensions() != dimensions) {
             throw new IllegalArgumentException("Item does not have dimensionality of : " + dimensions);
         }
-        // 获取该节点被分配到randomLevel层数
+        // 获取该节点被分配到randomLevel层数，即它的maxLevel
         int randomLevel = assignLevel(item.id(), this.levelLambda);
         // 每层都维护一份邻居列表，randomLevel,...,1,0
         IntArrayList[] connections = new IntArrayList[randomLevel + 1];
@@ -252,7 +256,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
             if (nodeCount >= this.maxItemCount) {
                 throw new SizeLimitExceededException("The number of elements exceeds the specified limit.");
             }
-
+            // 给插入节点分配id=插入HNSW图的顺序
             int newNodeId = nodeCount++;
             synchronized (excludedCandidates) {
                 excludedCandidates.add(newNodeId);
@@ -260,6 +264,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
             // 创建新节点对象
             Node<TItem> newNode = new Node<>(newNodeId, connections, item, false);
             nodes.set(newNodeId, newNode);
+            // 观察map，用于快速判断一个item id对应的节点是否存在于hnsw图
             lookup.put(item.id(), newNodeId);
             deletedItemVersions.remove(item.id());
 
@@ -380,7 +385,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
             }
             // 给插入点q和其邻居节点e建立连接
             newItemConnections.add(selectedNeighbourId);
-            // 获取邻居的真实节点对象
+            // 获取邻居e的真实节点对象
             Node<TItem> neighbourNode = nodes.get(selectedNeighbourId);
             // 检查该邻居节点e的连接数是否超过Mmax，如果超过，则需进行收缩
             synchronized (neighbourNode) {
@@ -403,7 +408,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
                     // 建立候选集合，是最大堆，堆顶是该堆里距离插入节点q最远的节点
                     PriorityQueue<NodeIdAndDistance<TDistance>> candidates = new PriorityQueue<>(comparator);
                     candidates.add(new NodeIdAndDistance<>(newNodeId, dMax, maxValueDistanceComparator));
-                    // 对节点e的每一个邻居，计算它们与节点q的距离，添加到最大堆中
+                    // 对节点e的每一个邻居，计算它们与节点e的距离，添加到最大堆中
                     neighbourConnectionsAtLevel.forEach(id -> {
                         TDistance dist = distanceFunction.distance(
                                 neighbourVector,
@@ -544,6 +549,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
     }
 
     /**
+     * 扩缩容
      * Changes the maximum capacity of the index.
      * @param newSize new size of the index
      */
@@ -1138,20 +1144,19 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
         return new Builder<>(false, dimensions, distanceFunction, distanceComparator, maxItemCount);
     }
 
+    /**
+     * 根据新节点的数据对象的id和随机种子lambda，生成新节点所能出现的最高层数
+     */
     private int assignLevel(TId value, double lambda) {
-
         // by relying on the external id to come up with the level, the graph construction should be a lot mor stable
         // see : https://github.com/nmslib/hnswlib/issues/28
-
         int hashCode = value.hashCode();
-
         byte[] bytes = new byte[]{
                 (byte) (hashCode >> 24),
                 (byte) (hashCode >> 16),
                 (byte) (hashCode >> 8),
                 (byte) hashCode
         };
-
         double random = Math.abs((double) Murmur3.hash32(bytes) / (double) Integer.MAX_VALUE);
 
         double r = -Math.log(random) * lambda;
@@ -1160,18 +1165,21 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
 
     /**
      * 判断 x是否小于y
-     * @param x
-     * @param y
-     * @return
      */
     private boolean lt(TDistance x, TDistance y) {
         return maxValueDistanceComparator.compare(x, y) < 0;
     }
 
+    /**
+     * 判断 x是否大于y
+     */
     private boolean gt(TDistance x, TDistance y) {
         return maxValueDistanceComparator.compare(x, y) > 0;
     }
 
+    /**
+     * 精准topK查询，用于确定召回率
+     */
     class ExactView implements Index<TId, TVector, TItem, TDistance> {
 
         private static final long serialVersionUID = 1L;
@@ -1296,11 +1304,11 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
 
         private static final long serialVersionUID = 1L;
 
-        final int id;
+        final int id; // 该节点在HNSW图中的序号
 
         final MutableIntList[] connections; // MutableIntList，int列表，int相比Integer性能更好
 
-        volatile TItem item;
+        volatile TItem item; // 该节点所包含的数据对象
 
         volatile boolean deleted;
 
@@ -1310,7 +1318,7 @@ public class HnswIndex<TId, TVector, TItem extends Item<TId, TVector>, TDistance
             this.item = item;
             this.deleted = deleted;
         }
-
+        // 节点所出现的每一层都有一个邻居列表，因此maxLevel为邻居列表的个数-1
         int maxLevel() {
             return this.connections.length - 1;
         }
